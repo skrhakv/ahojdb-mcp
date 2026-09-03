@@ -2,8 +2,6 @@
 
 import sys
 from json import load
-from pathlib import Path
-from subprocess import run
 from typing import Annotated
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -13,179 +11,114 @@ from mcp.server import MCPServer
 from pydantic import Field
 
 
-HUMAN_PROTEIN_DATA_DIRECTORY = Path(__file__).parent / "data"
-HUMAN_BIOLOGICAL_PROCESS_TERMS = (
-    HUMAN_PROTEIN_DATA_DIRECTORY / "9606.protein.enrichment.terms.v12.0.txt"
-)
-HUMAN_BIOLOGICAL_PROCESS_TERMS_URL = (
-    "https://stringdb-downloads.org/download/protein.enrichment.terms.v12.0/"
-    "9606.protein.enrichment.terms.v12.0.txt.gz"
-)
-
-
 # Create the MCP server.
-mcp = MCPServer("string-workshop")
+mcp = MCPServer("apoholo-workshop")
 
 
-@mcp.tool(title="STRING: Search human Biological Process terms")
-def search_human_biological_process_terms(
-    query: Annotated[
+@mcp.tool(title="AhojDB: Search apo/holo protein structures")
+def search_apoholo(
+    pdb_ids: Annotated[
         str,
         Field(
             description=(
-                "Required. Text to search for in human Gene Ontology Biological Process term "
-                "descriptions. Searches case-insensitively. Example: cell cycle"
-            )
+                "Optional. Comma-separated PDB IDs to look up in AhojDB. "
+                "Example: 1a73,2hhb"
+            ),
         ),
-    ],
-    limit: Annotated[
-        int,
+    ] = "",
+    uniprot_ids: Annotated[
+        str,
         Field(
-            description="Optional. Maximum number of matching terms to return. Default: 5.",
-            ge=1,
-            le=20,
+            description="Optional. Comma-separated UniProt accessions. Example: Q94702",
         ),
-    ] = 5,
-) -> dict:
-    """
-    Finds human Gene Ontology Biological Process terms whose descriptions match
-    the supplied text.
-
-    Each match contains a GO ID and term description. Results are deduplicated
-    across STRING proteins.
-    """
-    print(
-        "Tool search_human_biological_process_terms called with parameters: "
-        f"query={query}, limit={limit}",
-        file=sys.stderr,
-    )
-
-    search_text = query.strip()
-    if not search_text:
-        return {"error": "query must not be empty"}
-
-    if not HUMAN_BIOLOGICAL_PROCESS_TERMS.is_file():
-        return {"error": "Human Biological Process term data is unavailable."}
-
-    matches: set[tuple[str, str]] = set()
-    more_matches = False
-
-    with open(HUMAN_BIOLOGICAL_PROCESS_TERMS, encoding="utf-8") as term_file:
-        for line in term_file:
-            _, _, go_id, description = line.rstrip().split("\t", maxsplit=3)
-            if search_text.casefold() not in description.casefold():
-                continue
-
-            match = (go_id, description)
-            if match in matches:
-                continue
-
-            if len(matches) >= limit:
-                more_matches = True
-                break
-
-            matches.add(match)
-
-    return {
-        "query": search_text,
-        "species": 9606,
-        "matches": [
-            {"go_id": go_id, "description": description}
-            for go_id, description in sorted(matches)
-        ],
-        "more_matches": more_matches,
-    }
-
-
-@mcp.tool(title="STRING: Get Gene Ontology Biological Process annotations")
-def string_biological_process_annotations(
-    identifier: Annotated[
+    ] = "",
+    ligands: Annotated[
         str,
         Field(
             description=(
-                "Required. One identifier accepted by STRING. Example: CDK1"
-            )
+                "Optional. Comma-separated ligand codes (PDB 3-letter chemical "
+                "component IDs). Example: ZN,HEM"
+            ),
         ),
-    ],
-    species: Annotated[
-        int,
-        Field(
-            description="Optional. NCBI taxonomy identifier for the proteins. Default: 9606 (human).",
-            ge=1,
-        ),
-    ] = 9606,
-    limit: Annotated[
+    ] = "",
+    pdb_limit: Annotated[
         int,
         Field(
             description=(
-                "Optional. Maximum number of Biological Process annotations to return. Default: 10."
+                "Optional. Maximum number of apo/holo PDB IDs to list per entry. "
+                "The exact total counts are always returned regardless of this "
+                "limit. Only raise it if the user explicitly wants the full list. "
+                "Default: 10."
             ),
             ge=1,
-            le=50,
         ),
     ] = 10,
 ) -> dict:
     """
-    Gets Gene Ontology Biological Process annotations for one protein.
+    Searches AhojDB (apoholo.cz) for precomputed apo (ligand-free) and holo
+    (ligand-bound) forms of protein structures.
+
+    Provide at least one of pdb_ids, uniprot_ids, or ligands. Each matching
+    entry describes one binding pocket, with counts of the apo and holo
+    structures found for it and a sample of the PDB IDs of those structures
+    (up to pdb_limit each; the exact totals are always reported).
     """
     print(
-        "Tool string_biological_process_annotations called with parameters: "
-        f"identifier={identifier}, species={species}, limit={limit}",
+        "Tool search_apoholo called with parameters: "
+        f"pdb_ids={pdb_ids}, uniprot_ids={uniprot_ids}, ligands={ligands}, "
+        f"pdb_limit={pdb_limit}",
         file=sys.stderr,
     )
 
-    identifier = identifier.strip()
-
-    if not identifier or "," in identifier or "\n" in identifier:
-        return {"error": "Provide exactly one identifier."}
+    if not (pdb_ids.strip() or uniprot_ids.strip() or ligands.strip()):
+        return {"error": "Provide at least one of pdb_ids, uniprot_ids, or ligands."}
 
     parameters = urlencode(
         {
-            "identifiers": identifier,
-            "species": species,
-            "caller_identity": "eccb_mcp_workshop",
+            "pdb_ids": pdb_ids.strip(),
+            "uniprot_ids": uniprot_ids.strip(),
+            "ligands": ligands.strip(),
         }
     )
-    url = f"https://string-db.org/api/json/functional_annotation?{parameters}"
+    url = f"https://apoholo.cz/api/db/search?{parameters}"
 
     try:
-        with urlopen(url, timeout=20) as response:
-            annotations = load(response)
+        with urlopen(url, timeout=30) as response:
+            result = load(response)
     except HTTPError as error:
-        return {"error": f"Could not retrieve annotations (HTTP {error.code})."}
-    except URLError as error:
-        return {"error": "Could not retrieve annotations."}
+        return {"error": f"Could not search AhojDB (HTTP {error.code})."}
+    except URLError:
+        return {"error": "Could not reach AhojDB."}
 
-    biological_process_annotations = [
-        annotation
-        for annotation in annotations
-        if annotation["category"] == "Process"
-    ]
+    entries = []
+    for entry in result.get("entries", []):
+        apo = sorted(set(entry.get("found_apo_pdbids") or []))
+        holo = sorted(set(entry.get("found_holo_pdbids") or []))
+        entries.append(
+            {
+                "entry_key": entry.get("entry_key"),
+                "query": entry.get("query"),
+                "pdb_id": entry.get("target_pdb_id"),
+                "ligand": entry.get("target_ligand"),
+                "uniprot_ids": entry.get("target_uniprot_ids"),
+                "assignment": entry.get("target_apoholo_assignment"),  # A=apo, H=holo
+                "resolution": entry.get("target_resolution"),
+                "num_apo_pdbs": entry.get("num_apo_pdbids"),
+                "num_holo_pdbs": entry.get("num_holo_pdbids"),
+                "apo_pdbs_sample": apo[:pdb_limit],
+                "holo_pdbs_sample": holo[:pdb_limit],
+                "pdbs_truncated": len(apo) > pdb_limit or len(holo) > pdb_limit,
+            }
+        )
 
     return {
-        "input_identifier": identifier,
-        "species": species,
-        "biological_process_annotations": biological_process_annotations[:limit],
-        "more_annotations": len(biological_process_annotations) > limit,
+        "query": {"pdb_ids": pdb_ids, "uniprot_ids": uniprot_ids, "ligands": ligands},
+        "num_entries": len(entries),
+        "entries": entries,
     }
 
 
 if __name__ == "__main__":
-    HUMAN_PROTEIN_DATA_DIRECTORY.mkdir(exist_ok=True)
-
-    if not HUMAN_BIOLOGICAL_PROCESS_TERMS.exists():
-        print("Downloading STRING v12.0 human Biological Process terms...", file=sys.stderr)
-        command = (
-            f"curl -L {HUMAN_BIOLOGICAL_PROCESS_TERMS_URL} | gzip -dc | "
-            f"grep 'Biological Process' > {HUMAN_BIOLOGICAL_PROCESS_TERMS}"
-        )
-        if run(command, shell=True).returncode != 0:
-            sys.exit(1)
-
-    if not HUMAN_BIOLOGICAL_PROCESS_TERMS.exists():
-        print("Could not download human Biological Process terms.", file=sys.stderr)
-        sys.exit(1)
-
     try:
         mcp.run(
             transport="streamable-http",
