@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import re
 import sys
 from json import load
@@ -14,6 +15,12 @@ from pydantic import Field
 
 # Create the MCP server.
 mcp = MCPServer("apoholo-workshop")
+
+
+def log_call(tool: str, **params: object) -> None:
+    """One line per tool invocation on stderr (captured by journald as a service)."""
+    args = ", ".join(f"{key}={value}" for key, value in params.items())
+    print(f"tool {tool} called: {args}", file=sys.stderr, flush=True)
 
 
 @mcp.tool(title="AhojDB: Search apo/holo protein structures")
@@ -71,11 +78,12 @@ def search_apoholo(
     structures found for it and a sample of the PDB IDs of those structures
     (up to pdb_limit each; the exact totals are always reported).
     """
-    print(
-        "Tool search_apoholo called with parameters: "
-        f"pdb_ids={pdb_ids}, uniprot_ids={uniprot_ids}, ligands={ligands}, "
-        f"pdb_limit={pdb_limit}",
-        file=sys.stderr,
+    log_call(
+        "search_apoholo",
+        pdb_ids=pdb_ids,
+        uniprot_ids=uniprot_ids,
+        ligands=ligands,
+        pdb_limit=pdb_limit,
     )
 
     if not (pdb_ids.strip() or uniprot_ids.strip() or ligands.strip()):
@@ -162,17 +170,13 @@ def get_pocket_residues(
     paired with its counterpart in that structure (matched by UniProt residue
     number), flagging residues that are unobserved in the conformer.
     """
-    print(
-        "Tool get_pocket_residues called with parameters: "
-        f"entry_key={entry_key}, pdb_id={pdb_id}",
-        file=sys.stderr,
-    )
+    log_call("get_pocket_residues", entry_key=entry_key, pdb_id=pdb_id)
 
     entry_key = entry_key.strip()
     if not entry_key:
         return {"error": "entry_key must not be empty."}
 
-    url = f"https://apoholo.cz/api/db/entry/{quote(entry_key)}/log"
+    url = f"https://apoholo.cz/api/db/entry/{quote(entry_key, safe='')}/log"
     try:
         with urlopen(url, timeout=30) as response:
             log = response.read().decode("utf-8", "replace")
@@ -316,11 +320,12 @@ def find_conformers(
     then most similar). The applied threshold is reported so it can be explained
     and adjusted.
     """
-    print(
-        "Tool find_conformers called with parameters: "
-        f"entry_key={entry_key}, min_observed_percent={min_observed_percent}, "
-        f"state={state}, limit={limit}",
-        file=sys.stderr,
+    log_call(
+        "find_conformers",
+        entry_key=entry_key,
+        min_observed_percent=min_observed_percent,
+        state=state,
+        limit=limit,
     )
 
     entry_key = entry_key.strip()
@@ -331,7 +336,7 @@ def find_conformers(
     if state not in ("holo", "apo", "all"):
         return {"error": "state must be one of: holo, apo, all."}
 
-    url = f"https://apoholo.cz/api/db/entry/{quote(entry_key)}/query-result"
+    url = f"https://apoholo.cz/api/db/entry/{quote(entry_key, safe='')}/query-result"
     try:
         with urlopen(url, timeout=60) as response:
             data = load(response)
