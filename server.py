@@ -73,10 +73,17 @@ def search_apoholo(
     Do NOT use this to get more detail on a structure already listed in a
     previous result — use a drill-down tool with its entry_key instead.
 
-    Provide at least one of pdb_ids, uniprot_ids, or ligands. Each matching
-    entry describes one binding pocket, with counts of the apo and holo
-    structures found for it and a sample of the PDB IDs of those structures
-    (up to pdb_limit each; the exact totals are always reported).
+    AhojDB has no free-text name search. To search by a protein NAME (e.g.
+    'hemoglobin'), first call resolve_protein to turn it into UniProt
+    accessions, then pass those as uniprot_ids here.
+
+    Provide at least one of pdb_ids, uniprot_ids, or ligands. Two output modes:
+    - By uniprot_ids only (a whole protein): a single accession can map to
+      hundreds of structures, so results are summarized by bound ligand
+      (mode='uniprot_ligand_summary') rather than listed row by row.
+    - By pdb_ids and/or ligands: one entry per matching binding pocket, with
+      apo/holo counts and a sample of PDB IDs (up to pdb_limit each; exact
+      totals always reported).
     """
     log_call(
         "search_apoholo",
@@ -106,8 +113,59 @@ def search_apoholo(
     except URLError:
         return {"error": "Could not reach AhojDB."}
 
+    entries_raw = result.get("entries", [])
+
+    # Protein-level query (by UniProt accession only): one accession can map to
+    # hundreds of entries -- the same pocket repeated across many PDBs -- so
+    # summarize by bound ligand instead of returning every row.
+    if uniprot_ids.strip() and not pdb_ids.strip():
+        groups: dict = {}
+        for entry in entries_raw:
+            ligand = entry.get("target_ligand")
+            group = groups.setdefault(
+                ligand, {"pdb_ids": set(), "positions": set(), "entry_keys": []}
+            )
+            group["pdb_ids"].add(entry.get("target_pdb_id"))
+            parts = (entry.get("entry_key") or "").split("-")
+            if len(parts) >= 4:
+                group["positions"].add(parts[-1])  # residue position of the ligand
+            group["entry_keys"].append(entry.get("entry_key"))
+
+        ligand_groups = sorted(
+            (
+                {
+                    "ligand": ligand,
+                    "num_structures": len(group["entry_keys"]),
+                    "num_pdbs": len(group["pdb_ids"]),
+                    "num_positions": len(group["positions"]),
+                    "sample_entry_keys": group["entry_keys"][:pdb_limit],
+                }
+                for ligand, group in groups.items()
+            ),
+            key=lambda g: g["num_structures"],
+            reverse=True,
+        )
+
+        return {
+            "query": {"uniprot_ids": uniprot_ids},
+            "mode": "uniprot_ligand_summary",
+            "total_entries": len(entries_raw),
+            "total_pdbs": len({e.get("target_pdb_id") for e in entries_raw}),
+            "num_ligands": len(ligand_groups),
+            "note": (
+                "Results for a whole UniProt accession, grouped by bound ligand. "
+                "A ligand group can span several binding pockets and residue "
+                "positions (num_positions) -- it is NOT necessarily one pocket, "
+                "and residue numbering also varies across structures. Use "
+                "sample_entry_keys with the drill-down tools, or search_apoholo "
+                "by pdb_ids, to inspect specific pockets."
+            ),
+            "ligand_groups": ligand_groups[:pdb_limit],
+            "ligands_truncated": len(ligand_groups) > pdb_limit,
+        }
+
     entries = []
-    for entry in result.get("entries", []):
+    for entry in entries_raw:
         apo = sorted(set(entry.get("found_apo_pdbids") or []))
         holo = sorted(set(entry.get("found_holo_pdbids") or []))
         entries.append(
@@ -131,6 +189,114 @@ def search_apoholo(
         "query": {"pdb_ids": pdb_ids, "uniprot_ids": uniprot_ids, "ligands": ligands},
         "num_entries": len(entries),
         "entries": entries,
+    }
+
+
+@mcp.tool(title="UniProt: Resolve a protein name to accessions")
+def resolve_protein(
+    name: Annotated[
+        str,
+        Field(
+            description=(
+                "Required. A protein name, gene name, or synonym to look up, "
+                "e.g. 'hemoglobin', 'cytochrome P450', 'HBB'."
+            ),
+        ),
+    ],
+    organism_id: Annotated[
+        int,
+        Field(
+            description=(
+                "Optional. NCBI taxonomy id to restrict the search. "
+                "Default: 9606 (human)."
+            ),
+            ge=1,
+        ),
+    ] = 9606,
+    limit: Annotated[
+        int,
+        Field(
+            description="Optional. Maximum number of candidate accessions. Default: 10.",
+            ge=1,
+        ),
+    ] = 10,
+) -> dict:
+    """
+    Resolves a protein name (or gene/synonym) to candidate UniProt accessions
+    for use as the uniprot_ids input of search_apoholo.
+
+    AhojDB is keyed by PDB structures and UniProt accessions, not free-text
+    names, so use this FIRST to turn a name like 'hemoglobin' into accessions.
+    A name is often ambiguous: it can map to several accessions -- protein
+    subunits (hemoglobin alpha/beta/...) or isoforms (many cytochrome P450s).
+    Choose the relevant one(s), ideally confirming with the user, then search.
+
+    Results are restricted to reviewed (Swiss-Prot) entries of the given
+    organism (human by default). Tell the user that the human default was
+    applied and can be changed via organism_id.
+    """
+    log_call("resolve_protein", name=name, organism_id=organism_id, limit=limit)
+
+    name = name.strip()
+    if not name:
+        return {"error": "name must not be empty."}
+
+    query = f"{name} AND reviewed:true AND organism_id:{organism_id}"
+    parameters = urlencode(
+        {
+            "query": query,
+            "fields": "accession,id,protein_name,gene_names,organism_name",
+            "format": "json",
+            "size": limit,
+        }
+    )
+    url = f"https://rest.uniprot.org/uniprotkb/search?{parameters}"
+
+    try:
+        with urlopen(url, timeout=30) as response:
+            data = load(response)
+    except HTTPError as error:
+        return {"error": f"Could not query UniProt (HTTP {error.code})."}
+    except URLError:
+        return {"error": "Could not reach UniProt."}
+
+    candidates = []
+    for record in data.get("results", []):
+        description = record.get("proteinDescription", {})
+        protein_name = (
+            description.get("recommendedName", {})
+            .get("fullName", {})
+            .get("value")
+        )
+        if not protein_name:
+            submitted = description.get("submissionNames") or []
+            if submitted:
+                protein_name = submitted[0].get("fullName", {}).get("value")
+        genes = [
+            gene.get("geneName", {}).get("value")
+            for gene in record.get("genes", [])
+            if gene.get("geneName")
+        ]
+        candidates.append(
+            {
+                "accession": record.get("primaryAccession"),
+                "protein_name": protein_name,
+                "genes": genes,
+                "organism": record.get("organism", {}).get("scientificName"),
+            }
+        )
+
+    return {
+        "name": name,
+        "organism_id": organism_id,
+        "note": (
+            f"Searched reviewed UniProt entries for organism {organism_id} "
+            "(9606 = human, the default). Tell the user the organism filter was "
+            "applied and can be changed. A name can map to several accessions "
+            "(subunits or isoforms); pick the relevant one(s) before searching."
+        ),
+        "num_candidates": len(candidates),
+        "candidates": candidates,
     }
 
 
